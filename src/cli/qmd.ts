@@ -343,6 +343,16 @@ async function showStatus(): Promise<void> {
   console.log(`${c.bold}QMD Status${c.reset}\n`);
   console.log(`Index: ${dbPath}`);
   console.log(`Size:  ${formatBytes(indexSize)}`);
+  // Surface the active embedding backend so users can tell at a glance whether
+  // qmd is calling OpenAI or running a local llama.cpp model. Mirrors the
+  // selection rule in getDefaultLlamaCpp(); does not instantiate an LLM.
+  if (process.env.OPENAI_API_KEY) {
+    const embedModel = process.env.QMD_OPENAI_EMBED_MODEL || "text-embedding-3-small";
+    console.log(`Backend: openai (${embedModel})`);
+  } else {
+    const embedModel = process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL_URI;
+    console.log(`Backend: llama.cpp (${embedModel})`);
+  }
 
   // MCP daemon status (check PID file liveness)
   const mcpCacheDir = process.env.XDG_CACHE_HOME
@@ -2768,6 +2778,16 @@ function showHelp(): void {
   console.log("Global options:");
   console.log("  --index <name>             - Use a named index (default: index)");
   console.log("  QMD_EDITOR_URI             - Editor link template for clickable TTY search output");
+  console.log("");
+  console.log("Embedding backend:");
+  console.log("  By default qmd embeds and generates with local GGUF models via node-llama-cpp.");
+  console.log("  Set OPENAI_API_KEY to route embeddings, query expansion, and rerank through the");
+  console.log("  OpenAI API instead (no local model download required).");
+  console.log("  OPENAI_API_KEY              - Enables the OpenAI backend when set");
+  console.log("  QMD_OPENAI_EMBED_MODEL      - OpenAI embed model (default: text-embedding-3-small)");
+  console.log("  QMD_OPENAI_GENERATE_MODEL   - OpenAI chat model (default: gpt-4o-mini)");
+  console.log("  QMD_EMBED_MODEL             - Local GGUF embed model URI (used when OPENAI_API_KEY is unset)");
+  console.log("  Run 'qmd status' to see which backend is active.");
   console.log("");
   console.log("Search options:");
   console.log("  -n <num>                   - Max results (default 5, or 20 for --files/--json)");

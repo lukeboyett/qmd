@@ -14,9 +14,11 @@ import {
   type LlamaEmbeddingContext,
   type Token as LlamaToken,
 } from "node-llama-cpp";
-import { homedir } from "os";
+import { homedir, cpus } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
+import OpenAI from "openai";
+import { get_encoding } from "tiktoken";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -469,6 +471,352 @@ function resolveExpandContextSize(configValue?: number): number {
     return DEFAULT_EXPAND_CONTEXT_SIZE;
   }
   return parsed;
+}
+
+// =============================================================================
+// OpenAI Implementation
+// =============================================================================
+
+/**
+ * LLM implementation backed by the OpenAI API.
+ *
+ * Activated when `OPENAI_API_KEY` is present in the environment (see
+ * `getDefaultLlamaCpp`). Local model identifiers passed via `options.model`
+ * are ignored — OpenAI embeddings always use the configured OpenAI model name
+ * (`QMD_OPENAI_EMBED_MODEL`, default `text-embedding-3-small`).
+ *
+ * Includes retry + backoff around transient transport/HTTP failures and a
+ * batch-to-single fallback so one flaky batch does not zero out every row.
+ */
+export class OpenAILLM implements LLM {
+  private client: OpenAI;
+  readonly embedModelName: string;
+  readonly generateModelName: string;
+  private embedCooldownUntil = 0;
+
+  constructor(config: { embedModel?: string; generateModel?: string; apiKey?: string } = {}) {
+    const apiKey = config.apiKey || process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      throw new Error("OPENAI_API_KEY environment variable or apiKey config required for OpenAI embeddings");
+    }
+
+    this.client = new OpenAI({ apiKey });
+    this.embedModelName = config.embedModel || process.env.QMD_OPENAI_EMBED_MODEL || "text-embedding-3-small";
+    this.generateModelName = config.generateModel || process.env.QMD_OPENAI_GENERATE_MODEL || "gpt-4o-mini";
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    await new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  private getRetryDelayMs(attempt: number): number {
+    const baseMs = 400;
+    const capped = Math.min(baseMs * (2 ** (attempt - 1)), 8000);
+    const jitter = Math.floor(Math.random() * 250);
+    return capped + jitter;
+  }
+
+  private isTransientEmbeddingError(error: unknown): boolean {
+    const status = typeof error === "object" && error !== null && "status" in error
+      ? Number((error as { status?: unknown }).status)
+      : undefined;
+    if (status !== undefined && [408, 409, 425, 429, 500, 502, 503, 504].includes(status)) {
+      return true;
+    }
+
+    const code = typeof error === "object" && error !== null && "code" in error
+      ? String((error as { code?: unknown }).code ?? "")
+      : "";
+    if (["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"].includes(code)) {
+      return true;
+    }
+
+    const cause = typeof error === "object" && error !== null && "cause" in error
+      ? (error as { cause?: unknown }).cause
+      : undefined;
+    if (cause && typeof cause === "object") {
+      const causeCode = "code" in cause ? String((cause as { code?: unknown }).code ?? "") : "";
+      if (["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"].includes(causeCode)) {
+        return true;
+      }
+    }
+
+    const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+    return message.includes("connection error")
+      || message.includes("fetch failed")
+      || message.includes("service unavailable")
+      || message.includes("temporarily unavailable")
+      || message.includes("rate limit")
+      || message.includes("timeout");
+  }
+
+  private summarizeEmbeddingError(error: unknown): string {
+    if (error instanceof Error && error.message) return error.message;
+    if (typeof error === "object" && error !== null && "message" in error) {
+      const message = (error as { message?: unknown }).message;
+      if (typeof message === "string" && message.trim()) return message;
+    }
+    return String(error);
+  }
+
+  private async waitForEmbedCooldown(): Promise<void> {
+    const remainingMs = this.embedCooldownUntil - Date.now();
+    if (remainingMs > 0) {
+      await this.sleep(remainingMs);
+    }
+  }
+
+  private async withEmbeddingRetry<T>(label: string, fn: () => Promise<T>, maxAttempts: number = 5): Promise<T> {
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      await this.waitForEmbedCooldown();
+      try {
+        return await fn();
+      } catch (error) {
+        lastError = error;
+        if (!this.isTransientEmbeddingError(error) || attempt === maxAttempts) {
+          break;
+        }
+
+        const delayMs = this.getRetryDelayMs(attempt);
+        this.embedCooldownUntil = Math.max(this.embedCooldownUntil, Date.now() + delayMs);
+        console.warn(`${label} transient failure (attempt ${attempt}/${maxAttempts}): ${this.summarizeEmbeddingError(error)}. Retrying in ${delayMs}ms...`);
+        await this.sleep(delayMs);
+      }
+    }
+
+    throw lastError;
+  }
+
+  async embed(text: string, _options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    try {
+      const response = await this.withEmbeddingRetry("OpenAI embedding", () => this.client.embeddings.create({
+        model: this.embedModelName,
+        input: text,
+      }));
+
+      const first = response.data[0];
+      if (!first || !first.embedding) {
+        throw new Error("OpenAI returned no embedding");
+      }
+
+      return {
+        embedding: first.embedding,
+        model: response.model,
+      };
+    } catch (error) {
+      console.error("OpenAI embedding error:", error);
+      return null;
+    }
+  }
+
+  async embedBatch(texts: string[], _options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
+    if (texts.length === 0) return [];
+
+    // OpenAI accepts up to 2048 inputs per request for text-embedding-3-small/large.
+    // Batch in chunks of 100 for a reasonable ceiling.
+    const BATCH_SIZE = 100;
+    const results: (EmbeddingResult | null)[] = [];
+
+    for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+      const batch = texts.slice(i, i + BATCH_SIZE);
+
+      try {
+        const response = await this.withEmbeddingRetry("OpenAI batch embedding", () => this.client.embeddings.create({
+          model: this.embedModelName,
+          input: batch,
+        }), 4);
+
+        const batchResults = response.data
+          .sort((a, b) => a.index - b.index)
+          .map(item => {
+            if (!item.embedding) return null;
+            return {
+              embedding: item.embedding,
+              model: response.model,
+            };
+          });
+
+        results.push(...batchResults);
+      } catch (error) {
+        console.error(`OpenAI batch embedding error for batch ${Math.floor(i / BATCH_SIZE) + 1}:`, error);
+        // Fallback: if the whole batch still fails after retries, retry each text
+        // individually so a transient 503/socket reset doesn't zero out the batch.
+        for (const text of batch) {
+          results.push(await this.embed(text));
+        }
+      }
+    }
+
+    return results;
+  }
+
+  async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    try {
+      const response = await this.client.chat.completions.create({
+        model: options.model || this.generateModelName,
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: options.maxTokens || 150,
+        temperature: options.temperature ?? 0.7,
+      });
+
+      const text = response.choices[0]?.message?.content || "";
+      return { text, model: response.model, done: true };
+    } catch (error) {
+      console.error("OpenAI generation error:", error);
+      return null;
+    }
+  }
+
+  async modelExists(model: string): Promise<ModelInfo> {
+    return { name: model, exists: true };
+  }
+
+  async expandQuery(query: string, options: { context?: string; includeLexical?: boolean } = {}): Promise<Queryable[]> {
+    const includeLexical = options.includeLexical ?? true;
+
+    try {
+      const prompt = `Expand this search query into 3 variations:
+1. lex: Exact keywords for keyword search
+2. vec: Natural language for semantic search
+3. hyde: Hypothetical document that would answer this query
+
+Query: ${query}
+
+Format each line as:
+type: text
+
+Example:
+lex: machine learning algorithms
+vec: How do machine learning algorithms work?
+hyde: A comprehensive guide to machine learning algorithms explains supervised and unsupervised learning...`;
+
+      const response = await this.client.chat.completions.create({
+        model: this.generateModelName,
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 300,
+        temperature: 0.7,
+      });
+
+      const text = response.choices[0]?.message?.content || "";
+      const lines = text.trim().split("\n");
+
+      const queryables: Queryable[] = [];
+      for (const line of lines) {
+        const colonIdx = line.indexOf(":");
+        if (colonIdx === -1) continue;
+
+        const type = line.slice(0, colonIdx).trim();
+        if (type !== 'lex' && type !== 'vec' && type !== 'hyde') continue;
+
+        const queryText = line.slice(colonIdx + 1).trim();
+        queryables.push({ type: type as QueryType, text: queryText });
+      }
+
+      const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== 'lex');
+      if (filtered.length > 0) return filtered;
+
+      const fallback: Queryable[] = [{ type: 'vec', text: query }];
+      if (includeLexical) fallback.unshift({ type: 'lex', text: query });
+      return fallback;
+    } catch (error) {
+      console.error("OpenAI query expansion error:", error);
+      const fallback: Queryable[] = [{ type: 'vec', text: query }];
+      if (includeLexical) fallback.unshift({ type: 'lex', text: query });
+      return fallback;
+    }
+  }
+
+  async rerank(query: string, documents: RerankDocument[], _options: RerankOptions = {}): Promise<RerankResult> {
+    // OpenAI has no native rerank API; fall back to embedding cosine similarity.
+    try {
+      const queryEmbed = await this.embed(query);
+      if (!queryEmbed) throw new Error("Failed to embed query for reranking");
+
+      const docTexts = documents.map(d => d.text);
+      const docEmbeds = await this.embedBatch(docTexts);
+
+      const results: RerankDocumentResult[] = documents.map((doc, index) => {
+        const docEmbed = docEmbeds[index];
+        if (!docEmbed) return { file: doc.file, score: 0, index };
+
+        const dotProduct = queryEmbed.embedding.reduce((sum, val, i) =>
+          sum + val * (docEmbed.embedding[i] ?? 0), 0);
+        const queryMag = Math.sqrt(queryEmbed.embedding.reduce((sum, val) => sum + val * val, 0));
+        const docMag = Math.sqrt(docEmbed.embedding.reduce((sum, val) => sum + val * val, 0));
+        const similarity = dotProduct / (queryMag * docMag);
+
+        return { file: doc.file, score: similarity, index };
+      });
+
+      results.sort((a, b) => b.score - a.score);
+      return { results, model: this.embedModelName };
+    } catch (error) {
+      console.error("OpenAI rerank error:", error);
+      return {
+        results: documents.map((doc, index) => ({ file: doc.file, score: 0, index })),
+        model: this.embedModelName,
+      };
+    }
+  }
+
+  /**
+   * Tokenize via tiktoken cl100k_base (the encoding used by
+   * text-embedding-3-small/large and GPT-4 family models).
+   */
+  async tokenize(text: string): Promise<readonly LlamaToken[]> {
+    try {
+      const encoding = get_encoding("cl100k_base");
+      const tokens = encoding.encode(text);
+      encoding.free();
+      return Array.from(tokens) as unknown as readonly LlamaToken[];
+    } catch (error) {
+      console.error("Tokenization error:", error);
+      return new Array(Math.ceil(text.length / 4)).fill(0) as unknown as readonly LlamaToken[];
+    }
+  }
+
+  async countTokens(text: string): Promise<number> {
+    const tokens = await this.tokenize(text);
+    return tokens.length;
+  }
+
+  async detokenize(tokens: readonly LlamaToken[]): Promise<string> {
+    try {
+      const encoding = get_encoding("cl100k_base");
+      const bytes = encoding.decode(new Uint32Array(tokens as unknown as number[]));
+      encoding.free();
+      return new TextDecoder().decode(bytes);
+    } catch (error) {
+      console.error("Detokenization error:", error);
+      return `[${tokens.length} tokens]`;
+    }
+  }
+
+  /**
+   * Device info for status display. OpenAI backend has no local GPU; returns
+   * CPU-only. Accepts (and ignores) the `allowBuild` option for signature
+   * parity with `LlamaCpp.getDeviceInfo`.
+   */
+  async getDeviceInfo(_options: { allowBuild?: boolean } = {}): Promise<{
+    gpu: string | false;
+    gpuOffloading: boolean;
+    gpuDevices: string[];
+    vram?: { total: number; used: number; free: number };
+    cpuCores: number;
+  }> {
+    return {
+      gpu: false,
+      gpuOffloading: false,
+      gpuDevices: [],
+      cpuCores: cpus().length,
+    };
+  }
+
+  async dispose(): Promise<void> {
+    // Nothing to dispose for the OpenAI client.
+  }
 }
 
 export class LlamaCpp implements LLM {
@@ -1394,11 +1742,11 @@ export class LlamaCpp implements LLM {
  * Coordinates with LlamaCpp idle timeout to prevent disposal during active sessions.
  */
 class LLMSessionManager {
-  private llm: LlamaCpp;
+  private llm: QmdLLM;
   private _activeSessionCount = 0;
   private _inFlightOperations = 0;
 
-  constructor(llm: LlamaCpp) {
+  constructor(llm: QmdLLM) {
     this.llm = llm;
   }
 
@@ -1434,7 +1782,7 @@ class LLMSessionManager {
     this._inFlightOperations = Math.max(0, this._inFlightOperations - 1);
   }
 
-  getLlamaCpp(): LlamaCpp {
+  getLlamaCpp(): QmdLLM {
     return this.llm;
   }
 }
@@ -1607,7 +1955,7 @@ export async function withLLMSession<T>(
  * Unlike withLLMSession, this does not use the global singleton.
  */
 export async function withLLMSessionForLlm<T>(
-  llm: LlamaCpp,
+  llm: QmdLLM,
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
@@ -1634,22 +1982,36 @@ export function canUnloadLLM(): boolean {
 // Singleton for default LlamaCpp instance
 // =============================================================================
 
-let defaultLlamaCpp: LlamaCpp | null = null;
+/**
+ * Union of concrete LLM implementations returned by `getDefaultLlamaCpp()`.
+ * Use this where a function accepts either the local (`LlamaCpp`) or hosted
+ * (`OpenAILLM`) backend.
+ */
+export type QmdLLM = LlamaCpp | OpenAILLM;
+
+let defaultLlamaCpp: QmdLLM | null = null;
 
 /**
- * Get the default LlamaCpp instance (creates one if needed)
+ * Get the default LLM instance (creates one if needed).
+ *
+ * Selects the OpenAI-backed implementation when `OPENAI_API_KEY` is set in
+ * the environment; otherwise uses the local `node-llama-cpp` implementation.
  */
-export function getDefaultLlamaCpp(): LlamaCpp {
+export function getDefaultLlamaCpp(): QmdLLM {
   if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+    if (process.env.OPENAI_API_KEY) {
+      defaultLlamaCpp = new OpenAILLM();
+    } else {
+      defaultLlamaCpp = new LlamaCpp();
+    }
   }
   return defaultLlamaCpp;
 }
 
 /**
- * Set a custom default LlamaCpp instance (useful for testing)
+ * Set a custom default LLM instance (useful for testing).
  */
-export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
+export function setDefaultLlamaCpp(llm: QmdLLM | null): void {
   defaultLlamaCpp = llm;
 }
 

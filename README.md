@@ -515,6 +515,44 @@ Supported model families:
 > since vectors are not cross-compatible between models. The prompt format is
 > automatically adjusted for each model family.
 
+### Embedding backend: OpenAI (hosted)
+
+QMD can route embeddings, query expansion, and reranking through the OpenAI API
+instead of running local GGUF models. This is useful when you want to skip the
+~2 GB of model downloads, don't have a GPU handy, or already have an OpenAI
+budget for your workflow.
+
+Activate it by exporting `OPENAI_API_KEY`. No flags or config changes required —
+`qmd status` will show `Backend: openai (...)` once the key is set.
+
+```sh
+export OPENAI_API_KEY="sk-..."
+qmd status            # confirms Backend: openai (text-embedding-3-small)
+qmd update
+qmd embed             # embeds via OpenAI instead of local GGUF
+qmd query "your question"
+```
+
+Model overrides:
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `QMD_OPENAI_EMBED_MODEL` | `text-embedding-3-small` | 1536-dim embeddings; `text-embedding-3-large` (3072 dim) also supported |
+| `QMD_OPENAI_GENERATE_MODEL` | `gpt-4o-mini` | Used for query expansion |
+
+Reranking falls back to cosine similarity on OpenAI embeddings when the hosted
+backend is active (OpenAI has no native rerank endpoint).
+
+Transient HTTP and transport failures (429, 5xx, socket resets) are retried
+with exponential backoff; a batch that fails after retries falls back to
+per-document embedding so one flaky batch doesn't zero out an entire index run.
+
+> **Note:** Switching between backends changes the vector dimensionality
+> (`embeddinggemma-300M` is 768-dim; `text-embedding-3-small` is 1536-dim), so
+> you must re-embed with `qmd embed -f` after toggling `OPENAI_API_KEY`.
+> Tokenization for chunking uses `tiktoken` (`cl100k_base` encoding) when the
+> OpenAI backend is active.
+
 ## Installation
 
 ```sh
@@ -797,6 +835,10 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
+| `OPENAI_API_KEY` | _(unset)_ | When set, routes embeddings/query expansion/rerank through OpenAI instead of local llama.cpp |
+| `QMD_OPENAI_EMBED_MODEL` | `text-embedding-3-small` | OpenAI embedding model when the OpenAI backend is active |
+| `QMD_OPENAI_GENERATE_MODEL` | `gpt-4o-mini` | OpenAI chat model used for query expansion |
+| `QMD_EMBED_MODEL` | `embeddinggemma-300M-Q8_0` | Local GGUF embedding model URI (llama.cpp backend) |
 
 ## How It Works
 

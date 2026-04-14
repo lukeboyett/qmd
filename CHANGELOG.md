@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Changes
+
+- Optional OpenAI embedding backend. Set `OPENAI_API_KEY` and qmd routes
+  embeddings, query expansion, and rerank through the OpenAI API instead
+  of downloading local GGUF models. `QMD_OPENAI_EMBED_MODEL` (default
+  `text-embedding-3-small`) and `QMD_OPENAI_GENERATE_MODEL` (default
+  `gpt-4o-mini`) pick the models. Local llama.cpp behavior is unchanged
+  when `OPENAI_API_KEY` is not set. Transient HTTP/transport failures
+  are retried with exponential backoff, and a failed batch falls back
+  to per-document embedding. `qmd status` now shows a `Backend:` line
+  so the active path is obvious.
+
 ### Fixes
 
 - GPU: respect explicit `QMD_LLAMA_GPU=metal|vulkan|cuda` backend overrides instead of always using auto GPU selection. #529
