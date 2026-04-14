@@ -78,7 +78,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, OpenAILLM, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -121,11 +121,19 @@ function getStore(): ReturnType<typeof createStore> {
       const config = loadConfig();
       syncConfigToDb(store.db, config);
       if (config.models) {
-        setDefaultLlamaCpp(new LlamaCpp({
-          embedModel: config.models.embed,
-          generateModel: config.models.generate,
-          rerankModel: config.models.rerank,
-        }));
+        // Honor OPENAI_API_KEY even when YAML `models:` is present. Local GGUF
+        // model identifiers from the YAML are not meaningful to the hosted
+        // backend, so OpenAILLM falls back to its own env-var/default
+        // selection (QMD_OPENAI_EMBED_MODEL, QMD_OPENAI_GENERATE_MODEL).
+        if (process.env.OPENAI_API_KEY) {
+          setDefaultLlamaCpp(new OpenAILLM());
+        } else {
+          setDefaultLlamaCpp(new LlamaCpp({
+            embedModel: config.models.embed,
+            generateModel: config.models.generate,
+            rerankModel: config.models.rerank,
+          }));
+        }
       }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
@@ -343,16 +351,13 @@ async function showStatus(): Promise<void> {
   console.log(`${c.bold}QMD Status${c.reset}\n`);
   console.log(`Index: ${dbPath}`);
   console.log(`Size:  ${formatBytes(indexSize)}`);
-  // Surface the active embedding backend so users can tell at a glance whether
-  // qmd is calling OpenAI or running a local llama.cpp model. Mirrors the
-  // selection rule in getDefaultLlamaCpp(); does not instantiate an LLM.
-  if (process.env.OPENAI_API_KEY) {
-    const embedModel = process.env.QMD_OPENAI_EMBED_MODEL || "text-embedding-3-small";
-    console.log(`Backend: openai (${embedModel})`);
-  } else {
-    const embedModel = process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL_URI;
-    console.log(`Backend: llama.cpp (${embedModel})`);
-  }
+  // Report the *actual* active backend rather than inferring from env, so a
+  // YAML-configured LlamaCpp singleton is labelled correctly even when
+  // OPENAI_API_KEY happens to be set. Constructors are cheap (models load
+  // lazily); both classes expose embedModelName without triggering a load.
+  const llm = getDefaultLlamaCpp();
+  const backendName = llm instanceof OpenAILLM ? "openai" : "llama.cpp";
+  console.log(`Backend: ${backendName} (${llm.embedModelName})`);
 
   // MCP daemon status (check PID file liveness)
   const mcpCacheDir = process.env.XDG_CACHE_HOME
