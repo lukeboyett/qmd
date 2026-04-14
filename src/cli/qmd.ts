@@ -120,20 +120,17 @@ function getStore(): ReturnType<typeof createStore> {
     try {
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      if (config.models) {
-        // Honor OPENAI_API_KEY even when YAML `models:` is present. Local GGUF
-        // model identifiers from the YAML are not meaningful to the hosted
-        // backend, so OpenAILLM falls back to its own env-var/default
-        // selection (QMD_OPENAI_EMBED_MODEL, QMD_OPENAI_GENERATE_MODEL).
-        if (process.env.OPENAI_API_KEY) {
-          setDefaultLlamaCpp(new OpenAILLM());
-        } else {
-          setDefaultLlamaCpp(new LlamaCpp({
-            embedModel: config.models.embed,
-            generateModel: config.models.generate,
-            rerankModel: config.models.rerank,
-          }));
-        }
+      // YAML `models:` only configures the local llama.cpp backend; GGUF URIs
+      // aren't meaningful to the hosted OpenAI backend. Pre-set a LlamaCpp
+      // configured from YAML when the local backend is active; getDefaultLlamaCpp()
+      // itself self-corrects if OPENAI_API_KEY is set, so pre-setting the wrong
+      // backend here is harmless but pointless.
+      if (config.models && !process.env.OPENAI_API_KEY) {
+        setDefaultLlamaCpp(new LlamaCpp({
+          embedModel: config.models.embed,
+          generateModel: config.models.generate,
+          rerankModel: config.models.rerank,
+        }));
       }
     } catch {
       // Config may not exist yet — that's fine, DB works without it

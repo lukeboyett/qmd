@@ -69,15 +69,19 @@ describe("OpenAI backend selection", () => {
     expect(llm).not.toBeInstanceOf(OpenAILLM);
   });
 
-  test("a pre-set LlamaCpp singleton wins over env selection", () => {
+  test("env selection wins over a pre-set singleton of the wrong backend", () => {
     // Simulates the CLI path where YAML `models:` config calls
-    // setDefaultLlamaCpp(new LlamaCpp(...)). getDefaultLlamaCpp() must return
-    // the pre-set instance rather than silently replacing it — the fix for
-    // that case lives in the caller (cli/qmd.ts), not here. This test
-    // documents the singleton's stickiness so status/backend-reporting code
-    // can rely on it.
+    // setDefaultLlamaCpp(new LlamaCpp(...)) before OPENAI_API_KEY was
+    // observed. The next getDefaultLlamaCpp() call must discard the stale
+    // pre-set and return an OpenAILLM to match the current env.
     process.env.OPENAI_API_KEY = "sk-test";
-    const preset = { kind: "preset" } as unknown as LlamaCpp;
+    setDefaultLlamaCpp(new LlamaCpp({}));
+    expect(getDefaultLlamaCpp()).toBeInstanceOf(OpenAILLM);
+  });
+
+  test("matching pre-set singleton is reused", () => {
+    process.env.OPENAI_API_KEY = "sk-test";
+    const preset = new OpenAILLM({ apiKey: "sk-test" });
     setDefaultLlamaCpp(preset);
     expect(getDefaultLlamaCpp()).toBe(preset);
   });

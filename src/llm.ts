@@ -673,16 +673,18 @@ export class OpenAILLM implements LLM {
     return { name: model, exists: true };
   }
 
-  async expandQuery(query: string, options: { context?: string; includeLexical?: boolean } = {}): Promise<Queryable[]> {
+  async expandQuery(query: string, options: { context?: string; includeLexical?: boolean; intent?: string } = {}): Promise<Queryable[]> {
     const includeLexical = options.includeLexical ?? true;
+    const intent = options.intent;
 
     try {
+      const intentLine = intent ? `Query intent: ${intent}\n\n` : "";
       const prompt = `Expand this search query into 3 variations:
 1. lex: Exact keywords for keyword search
 2. vec: Natural language for semantic search
 3. hyde: Hypothetical document that would answer this query
 
-Query: ${query}
+${intentLine}Query: ${query}
 
 Format each line as:
 type: text
@@ -1996,15 +1998,21 @@ let defaultLlamaCpp: QmdLLM | null = null;
  *
  * Selects the OpenAI-backed implementation when `OPENAI_API_KEY` is set in
  * the environment; otherwise uses the local `node-llama-cpp` implementation.
+ *
+ * If a cached singleton is present but does not match the currently requested
+ * backend (for example, a `setDefaultLlamaCpp(new LlamaCpp(...))` call from
+ * YAML model-config ran before `OPENAI_API_KEY` was set), the stale singleton
+ * is discarded and replaced so the env variable always wins. An exact-match
+ * cached singleton is returned as-is so repeat callers keep sharing state.
  */
 export function getDefaultLlamaCpp(): QmdLLM {
-  if (!defaultLlamaCpp) {
-    if (process.env.OPENAI_API_KEY) {
-      defaultLlamaCpp = new OpenAILLM();
-    } else {
-      defaultLlamaCpp = new LlamaCpp();
-    }
+  const wantsOpenAI = !!process.env.OPENAI_API_KEY;
+  if (defaultLlamaCpp) {
+    const isOpenAI = defaultLlamaCpp instanceof OpenAILLM;
+    if (isOpenAI === wantsOpenAI) return defaultLlamaCpp;
+    defaultLlamaCpp = null;
   }
+  defaultLlamaCpp = wantsOpenAI ? new OpenAILLM() : new LlamaCpp();
   return defaultLlamaCpp;
 }
 
