@@ -1705,7 +1705,14 @@ async function vectorIndex(
     return;
   }
 
-  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
+  const activeEmbedder = getDefaultLlamaCpp();
+  const effectiveModel = activeEmbedder.embedModelName;
+  const backendLabel = activeEmbedder instanceof OpenAILLM ? "openai" : "llama.cpp";
+  console.log(`${c.dim}Backend: ${backendLabel} (${effectiveModel})${c.reset}`);
+  if (model !== effectiveModel) {
+    console.log(`${c.dim}Requested model: ${model}${c.reset}`);
+  }
+  console.log("");
   if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
     const maxDocsPerBatch = batchOptions.maxDocsPerBatch ?? DEFAULT_EMBED_MAX_DOCS_PER_BATCH;
     const maxBatchBytes = batchOptions.maxBatchBytes ?? DEFAULT_EMBED_MAX_BATCH_BYTES;

@@ -1530,7 +1530,7 @@ export async function generateEmbeddings(
             const chunk = chunkBatch[i]!;
             const embedding = embeddings[i];
             if (embedding) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), embedding.model || model, now);
               chunksEmbedded++;
             } else {
               errors++;
@@ -1549,7 +1549,7 @@ export async function generateEmbeddings(
                 const text = formatDocForEmbedding(chunk.text, chunk.title, embedModelUri);
                 const result = await session.embed(text, { model });
                 if (result) {
-                  insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+                  insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), result.model || model, now);
                   chunksEmbedded++;
                 } else {
                   errors++;
